@@ -320,6 +320,73 @@ public class DatabaseScanner
     }
 
     
+    private async Task<string?> GetConstValAsync(
+        FbConnection connection,
+        string tableName,
+        string key,
+        CancellationToken cancellationToken)
+    {
+        var sql = $@" SELECT val FROM {tableName} WHERE UPPER(TRIM(name)) = @key ROWS 1";
+
+        try
+        {
+            var obj = await connection.ExecuteScalarAsync(sql, new { key = key.Trim().ToUpperInvariant() });
+            if (obj == null || obj == DBNull.Value)
+                return null;
+
+            
+            var s = obj.ToString();
+            if (string.IsNullOrWhiteSpace(s))
+                return null;
+
+            return s.Trim().Trim('\'', '"');
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning($"Ошибка чтения константы '{key}' из {tableName}: {ex.Message}");
+            return null;
+        }
+    }
+
+    // Ищет константу по списку возможных ключей и возвращает первое найденное значение
+    private async Task<(string? value, string? matchedKey)> GetConstValAnyAsync(
+        FbConnection connection,
+        string tableName,
+        IEnumerable<string> keys,
+        CancellationToken cancellationToken)
+    {
+        foreach (var k in keys)
+        {
+            var v = await GetConstValAsync(connection, tableName, k, cancellationToken);
+            if (!string.IsNullOrEmpty(v))
+                return (v, k);
+        }
+
+        return (null, null);
+    }
+
+    private async Task<(int? value, string? matchedKey)> GetConstIntAnyAsync(
+        FbConnection connection,
+        string tableName,
+        IEnumerable<string> keys,
+        CancellationToken cancellationToken)
+    {
+        var (str, matched) = await GetConstValAnyAsync(connection, tableName, keys, cancellationToken);
+
+        if (string.IsNullOrEmpty(str))
+            return (null, null);
+
+
+        var cleaned = str.Trim().Trim('\'', '"');
+
+        if (int.TryParse(cleaned, out var i))
+            return (i, matched);
+
+        Logger.LogWarning($"Константа '{matched}' найдена, но не int: '{str}'");
+        return (null, matched);
+    }
+
+
     private string GetConnectionStringForLog(string connectionString)
     {
         return connectionString.Replace("masterkey", "*****")
@@ -386,25 +453,27 @@ public class DatabaseScanner
                 }
             }
 
-            int? nhozCurrent = await GetNhozCurrentAsync(connection, tableName, cancellationToken);
-            if (!nhozCurrent.HasValue)
-            {
-                nhozCurrent = await GetNhozAlternativeAsync(connection, tableName, cancellationToken);
-                if (!nhozCurrent.HasValue)
-                {
-                    throw new Exception("Не удалось получить OWN_NHOZ из БД");
-                }
-            }
+            var nhozKeys = new[] { "OWN_NHOZ", "Own_Nhoz", "CURRENT_HOZ", "NHOZ", "HOZ_ID", "FARM_ID" };
 
-            result.NHoz = nhozCurrent.Value; 
+            var (nhozValue, matchedKey) = await GetConstIntAnyAsync(connection, tableName, nhozKeys, cancellationToken);
 
-            var shozData = await GetShozDataAsync(connection, nhozCurrent.Value, cancellationToken);
+            if (!nhozValue.HasValue)
+                throw new Exception("Не удалось получить NHOZ из таблицы констант (G_CONST/G_CONSTB)");
+
+            int nhoz = nhozValue.Value;
+            result.NHoz = nhoz;
+
+
+            Logger.LogInfo($"NHOZ найден по ключу '{matchedKey}', значение: {result.NHoz}");
+
+
+            var shozData = await GetShozDataAsync(connection, nhoz, cancellationToken);
             if (shozData == null || string.IsNullOrEmpty(shozData.IM))
             {
-                shozData = await GetShozAlternativeAsync(connection, nhozCurrent.Value, cancellationToken);
+                shozData = await GetShozAlternativeAsync(connection, nhoz, cancellationToken);
                 if (shozData == null || string.IsNullOrEmpty(shozData.IM))
                 {
-                    throw new Exception($"Не найдено хозяйство с NHOZ = {nhozCurrent.Value}");
+                    throw new Exception($"Не найдено хозяйство с NHOZ = {nhoz}");
                 }
             }
 
@@ -645,40 +714,6 @@ public class DatabaseScanner
     }
 
 
-    private async Task<int?> GetNhozAlternativeAsync(
-        FbConnection connection,
-        string tableName,
-        CancellationToken cancellationToken)
-    {
-        var possibleNames = new[] { "OWN_NHOZ", "CURRENT_HOZ", "NHOZ", "HOZ_ID", "FARM_ID" };
-
-        foreach (var name in possibleNames)
-        {
-            try
-            {
-                var sql = $"SELECT val FROM {tableName} WHERE name = '{name}'";
-                var result = await connection.ExecuteScalarAsync(sql);
-
-                if (result != null && result != DBNull.Value)
-                {
-                    string strValue = result.ToString()!;
-                    strValue = strValue.Trim('\'', '"', ' ', '\t');
-
-                    if (int.TryParse(strValue, out int nhoz))
-                    {
-                        Logger.LogInfo($"Найдено поле {name} со значением {nhoz}");
-                        return nhoz;
-                    }
-                }
-            }
-            catch
-            {
-                continue;
-            }
-        }
-
-        return null;
-    }
 
 
     private async Task<ShozData?> GetShozAlternativeAsync(
@@ -804,38 +839,7 @@ public class DatabaseScanner
         }
     }
 
-    // Получает значение OWN_NHOZ из таблицы констант
-    private async Task<int?> GetNhozCurrentAsync(
-        FbConnection connection,
-        string tableName,
-        CancellationToken cancellationToken)
-    {
-        const string query = "SELECT val FROM {0} WHERE name = 'OWN_NHOZ'";
-
-        try
-        {
-            var sql = string.Format(query, tableName);
-            var result = await connection.ExecuteScalarAsync(sql);
-
-            if (result != null && result != DBNull.Value)
-            {
-                string strValue = result.ToString()!;
-                strValue = strValue.Trim('\'', '"', ' ', '\t');
-
-                if (int.TryParse(strValue, out int nhoz))
-                {
-                    return nhoz;
-                }
-            }
-
-            return null;
-        }
-        catch (Exception ex)
-        {
-            Logger.LogWarning($"Ошибка при получении OWN_NHOZ: {ex.Message}");
-            return null;
-        }
-    }
+  
 
     // Получает данные из таблицы SHOZ для указанного NHOZ
     private async Task<ShozData?> GetShozDataAsync(
